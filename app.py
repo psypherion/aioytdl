@@ -257,6 +257,7 @@ def base_opts(cookies_path="cookies.txt"):
 
     }
 
+    cookies_path = "cookies.txt"
     # ── 1. Explicit path ──────────────────────────────────────────────────────
     if cookies_path and Path(cookies_path).exists():
         opts["cookiefile"] = str(cookies_path)
