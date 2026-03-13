@@ -1,0 +1,6 @@
+flask>=3.0
+yt-dlp>=2024.01.01
+browser_cookie3
+# Optional — for Google OAuth age-restriction bypass
+# google-auth-oauthlib>=1.0
+
