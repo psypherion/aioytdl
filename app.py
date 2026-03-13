@@ -25,14 +25,14 @@ from flask import (
 )
 import yt_dlp
 
-# ─── Google OAuth (optional — works without it) ─────────────────────────────
+# ─── Google OAuth (optional) ──────────────────────────────────────────────────────
 try:
     from google_auth_oauthlib.flow import Flow
     OAUTH_AVAILABLE = True
 except ImportError:
     OAUTH_AVAILABLE = False
 
-# ─── browser_cookie3 (optional — auto cookie detection) ─────────────────────
+# ─── browser_cookie3 (optional) ───────────────────────────────────────────────────
 try:
     import browser_cookie3
     BC3_AVAILABLE = True
@@ -76,11 +76,9 @@ _YTDLP_BROWSER_PRIORITY = ["chrome", "firefox", "edge", "brave", "chromium"]
 def auto_extract_cookies(save_path: Path = None) -> tuple:
     if not BC3_AVAILABLE:
         return False, "browser_cookie3 is not installed."
-
     dest = Path(save_path or COOKIES_FILE)
     collected: dict = {}
     found_browsers: list = []
-
     for display_name, func_name in _BROWSER_LOADERS:
         loader = getattr(browser_cookie3, func_name, None)
         if loader is None:
@@ -97,10 +95,8 @@ def auto_extract_cookies(save_path: Path = None) -> tuple:
                 pass
         if browser_count:
             found_browsers.append(f"{display_name}({browser_count})")
-
     if not collected:
         return False, "No YouTube / Google cookies found in any browser."
-
     lines = [
         "# Netscape HTTP Cookie File",
         "# Automatically extracted by YTDLPro — do not edit manually",
@@ -108,17 +104,12 @@ def auto_extract_cookies(save_path: Path = None) -> tuple:
     ]
     for c in collected.values():
         domain  = c.domain if c.domain.startswith(".") else f".{c.domain}"
-        inc_sub = "TRUE"
         path    = c.path or "/"
         secure  = "TRUE" if c.secure else "FALSE"
         expiry  = str(int(c.expires)) if c.expires else "2147483647"
-        name    = c.name  or ""
-        value   = c.value or ""
-        lines.append(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
-
+        lines.append(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{c.name or ''}\t{c.value or ''}")
     dest.write_text("\n".join(lines), "utf-8")
-    msg = f"Saved {len(collected)} cookies from: {', '.join(found_browsers)}."
-    return True, msg
+    return True, f"Saved {len(collected)} cookies from: {', '.join(found_browsers)}."
 
 
 def detect_available_browsers() -> list:
@@ -135,6 +126,36 @@ def detect_available_browsers() -> list:
         except Exception:
             pass
     return available
+
+
+# ─── Format Selector Helper ──────────────────────────────────────────────────────
+
+def video_fmt(quality: str) -> str:
+    """
+    Build a bullet-proof format string for video downloads.
+
+    Priority chain:
+      1. Best separate video + best separate audio at requested height  (needs ffmpeg merge)
+      2. Best single muxed stream at requested height                   (tv_embedded / mweb)
+      3. Absolute best muxed stream regardless of height               (ultimate fallback)
+
+    The chain guarantees a file is always produced even when the
+    tv_embedded / mweb clients only expose muxed streams.
+    """
+    if quality == "best":
+        return (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best[ext=mp4]/best"
+        )
+    h = quality  # e.g. "720", "1080"
+    return (
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={h}]+bestaudio/"
+        f"best[height<={h}][ext=mp4]/"
+        f"best[height<={h}]/"
+        f"best[ext=mp4]/best"
+    )
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -193,14 +214,17 @@ def extract_vid(url):
 
 def base_opts(cookies_path=None):
     """
-    Build base yt-dlp options.
+    Build base yt-dlp options with bot-bypass and robust cookie handling.
 
-    Bot-bypass strategy (applied in all environments including Railway):
-      • Use tv_embedded + mweb player clients — these don't require a PO token
-        and are far less aggressively bot-checked by YouTube.
-      • Pass cookiefile if cookies.txt exists on disk.
-      • Never attempt cookiesfrombrowser on server (no browser installed).
-      • geo_bypass + nocheckcertificate for datacenter IPs.
+    Player client order:
+      - ios         : gets adaptive (separate) streams; rarely bot-checked
+      - tv_embedded : gets muxed streams; almost never bot-checked
+      - mweb        : mobile web fallback
+      - web         : last resort
+
+    Using ios first means we get high-quality separate streams for merge,
+    while tv_embedded acts as the muxed fallback — the format chain in
+    video_fmt() handles whichever streams are actually available.
     """
     opts = {
         "quiet":              True,
@@ -208,42 +232,42 @@ def base_opts(cookies_path=None):
         "noprogress":         True,
         "socket_timeout":     30,
         "retries":            8,
+        "fragment_retries":   5,
         "nocheckcertificate": True,
         "age_limit":          None,
         "geo_bypass":         True,
-        # ── Key fix: tv_embedded + mweb clients bypass bot-detection
-        #    without needing PO token or a real browser session.
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "mweb", "web"],
+                # ios gives adaptive streams without PO token on most videos
+                # tv_embedded is the muxed-only fallback that bypasses bot check
+                "player_client": ["ios", "tv_embedded", "mweb", "web"],
                 "skip": ["translated_subs"],
             }
         },
-        # Spoof a real browser User-Agent
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
-    # ── Cookie resolution priority ────────────────────────────────────────────
-    # 1. Explicit path passed by caller
+    # ── Cookie resolution ─────────────────────────────────────────────────────
     if cookies_path and Path(cookies_path).exists():
         opts["cookiefile"] = str(cookies_path)
         return opts
-
-    # 2. cookies.txt on disk (uploaded manually or via OAuth)
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 50:
         opts["cookiefile"] = str(COOKIES_FILE)
         return opts
-
-    # 3. On a real machine (local dev): try yt-dlp native browser extraction
-    #    Skip on Railway/CI — no browser is installed there.
-    is_server = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("CI")
+    # Only attempt browser extraction on local machines, not on Railway/Render/CI
+    is_server = (
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RAILWAY_PROJECT_ID")
+        or os.environ.get("RENDER")
+        or os.environ.get("CI")
+    )
     if not is_server:
         for browser_name in _YTDLP_BROWSER_PRIORITY:
             try:
@@ -251,7 +275,6 @@ def base_opts(cookies_path=None):
                 break
             except Exception:
                 continue
-
     return opts
 
 
@@ -313,8 +336,6 @@ class ProgressTracker:
 @app.route("/")
 def index(): return render_template("index.html")
 
-
-# ── Info ──────────────────────────────────────────────────────────────────────
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
@@ -411,8 +432,6 @@ def get_info():
         return jsonify({"error": str(e)[:300]}), 500
 
 
-# ── SSE Progress ──────────────────────────────────────────────────────────────
-
 @app.route("/api/progress/<task_id>")
 def progress_stream(task_id):
     def gen():
@@ -430,8 +449,6 @@ def progress_stream(task_id):
     )
 
 
-# ── Single Download ───────────────────────────────────────────────────────────
-
 @app.route("/api/download/start", methods=["POST"])
 def download_start():
     data     = request.json or {}
@@ -444,7 +461,6 @@ def download_start():
     task_id = uuid.uuid4().hex[:8]
     tracker = ProgressTracker()
     with progress_lock: progress_store[task_id] = tracker
-
     tmp = DOWNLOAD_DIR / f"tmp_{task_id}"
     tmp.mkdir(exist_ok=True)
 
@@ -469,7 +485,8 @@ def _do_one(url, mode, quality, sub_lang, tmp, tracker, task_id):
 
     if mode == "audio":
         tracker.set_phase("Downloading audio…")
-        opts["format"] = "bestaudio/best"
+        # bestaudio/best — always works regardless of client
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3", "preferredquality": "320",
@@ -483,16 +500,12 @@ def _do_one(url, mode, quality, sub_lang, tmp, tracker, task_id):
         opts["skip_download"]     = True
     else:
         tracker.set_phase("Downloading video…")
-        opts["format"] = (
-            f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-            if quality != "best" else "bestvideo+bestaudio/best"
-        )
+        opts["format"]              = video_fmt(quality)
         opts["merge_output_format"] = "mp4"
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     if not info: raise RuntimeError("Download returned no info")
-
     _log_single(info, url, mode, quality, tmp)
     tracker.set_status("done")
 
@@ -504,22 +517,18 @@ def _do_all(url, quality, sub_lang, tmp, tracker, task_id):
 
     tracker.set_phase("Step 1/3 — Downloading video…"); tracker.reset()
     vo = base_opts(); vo["progress_hooks"] = [tracker.hook]
-    vo["format"] = (
-        f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-        if quality != "best" else "bestvideo+bestaudio/best"
-    )
+    vo["format"]              = video_fmt(quality)
     vo["merge_output_format"] = "mp4"
     vo["outtmpl"] = str(vd / "%(title)s [%(id)s].%(ext)s")
     with yt_dlp.YoutubeDL(vo) as ydl:
         info = ydl.extract_info(url, download=True)
     if not info: raise RuntimeError("Video download failed")
-
     vid   = info.get("id") or extract_vid(url)
     title = sanitize(info.get("title", "video"))
 
     tracker.set_phase("Step 2/3 — Extracting audio…"); tracker.reset()
     ao = base_opts(); ao["progress_hooks"] = [tracker.hook]
-    ao["format"]  = "bestaudio/best"
+    ao["format"]  = "bestaudio[ext=m4a]/bestaudio/best"
     ao["outtmpl"] = str(ad / "%(title)s [%(id)s].%(ext)s")
     ao["postprocessors"] = [{
         "key": "FFmpegExtractAudio",
@@ -546,7 +555,6 @@ def _do_all(url, quality, sub_lang, tmp, tracker, task_id):
         for sub in (vd, ad, sd):
             for fp in sub.iterdir():
                 if fp.is_file(): zf.write(fp, f"{sub.name}/{fp.name}")
-
     _log_single(info, url, "all", quality, tmp,
                 override_file=zpath, override_name=zname)
     tracker.set_status("done")
@@ -590,7 +598,6 @@ def _log_single(info, url, mode, quality, tmp,
 def download_file(task_id):
     tmp = DOWNLOAD_DIR / f"tmp_{task_id}"
     if not tmp.exists(): return jsonify({"error": "File not found"}), 404
-
     zips = list(tmp.glob("*.zip"))
     if zips:
         f = zips[0]
@@ -602,13 +609,9 @@ def download_file(task_id):
         )
         if not files: return jsonify({"error": "No files"}), 404
         f = files[0]
-
     with progress_lock: progress_store.pop(task_id, None)
-    return send_file(str(f), as_attachment=True,
-                     download_name=sanitize(f.name))
+    return send_file(str(f), as_attachment=True, download_name=sanitize(f.name))
 
-
-# ── Batch / Playlist ─────────────────────────────────────────────────────────
 
 @app.route("/api/download/batch", methods=["POST"])
 def download_batch():
@@ -636,31 +639,23 @@ def download_batch():
             if not url: continue
             itrk = ProgressTracker()
             with progress_lock: progress_store[f"{task_id}_item"] = itrk
-
             opts = base_opts(); opts["progress_hooks"] = [itrk.hook]
             opts["outtmpl"] = str(out_dir / "%(title)s [%(id)s].%(ext)s")
             if mode == "audio":
-                opts["format"] = "bestaudio/best"
+                opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
                 opts["postprocessors"] = [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3", "preferredquality": "320",
                 }]
             elif mode == "all":
-                fmt = (
-                    f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-                    if quality != "best" else "bestvideo+bestaudio/best"
-                )
-                opts["format"]              = fmt
+                opts["format"]              = video_fmt(quality)
                 opts["writesubtitles"]      = True
                 opts["writeautomaticsub"]   = True
                 opts["subtitleslangs"]      = ["en"]
                 opts["merge_output_format"] = "mp4"
             else:
-                fmt = (
-                    f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-                    if quality != "best" else "bestvideo+bestaudio/best"
-                )
-                opts["format"] = fmt; opts["merge_output_format"] = "mp4"
+                opts["format"]              = video_fmt(quality)
+                opts["merge_output_format"] = "mp4"
 
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -692,8 +687,7 @@ def download_batch():
                         "quality":         quality,
                         "filename":        actual.name if actual else "",
                         "filepath":        str(actual) if actual else "",
-                        "filesize":        (actual.stat().st_size
-                                           if actual and actual.exists() else 0),
+                        "filesize":        (actual.stat().st_size if actual and actual.exists() else 0),
                         "thumbnail_local": grab_thumb(thumb_url, vid),
                         "thumbnail_url":   thumb_url,
                         "duration":        info.get("duration"),
@@ -710,8 +704,7 @@ def download_batch():
 
         with task_lock:
             t = active_tasks[task_id]
-            t["status"]   = "completed"
-            t["percent"]  = 100
+            t["status"] = "completed"; t["percent"] = 100
             t["finished"] = datetime.now().isoformat()
 
     threading.Thread(target=run, daemon=True).start()
@@ -731,8 +724,6 @@ def task_status(task_id):
     return jsonify(task)
 
 
-# ── History ───────────────────────────────────────────────────────────────────
-
 @app.route("/api/history")
 def get_history():
     d = load_log(); d["sessions"].reverse(); return jsonify(d)
@@ -740,16 +731,12 @@ def get_history():
 
 @app.route("/api/history/clear", methods=["POST"])
 def clear_history():
-    save_log({
-        "sessions": [], "stats": {
-            "total_downloads": 0, "total_videos": 0,
-            "total_audio": 0, "total_playlists": 0,
-        }
-    })
+    save_log({"sessions": [], "stats": {
+        "total_downloads": 0, "total_videos": 0,
+        "total_audio": 0, "total_playlists": 0,
+    }})
     return jsonify({"ok": True})
 
-
-# ── Auth & Cookies ────────────────────────────────────────────────────────────
 
 @app.route("/api/cookies", methods=["POST"])
 def upload_cookies():
@@ -761,14 +748,13 @@ def upload_cookies():
 
 @app.route("/api/cookies/status")
 def cookies_status():
-    available_browsers = detect_available_browsers()
     return jsonify({
         "exists":             COOKIES_FILE.exists(),
         "cookies_file":       str(COOKIES_FILE) if COOKIES_FILE.exists() else None,
         "oauth_available":    OAUTH_AVAILABLE,
         "oauth_connected":    bool(session.get("google_creds")),
         "bc3_available":      BC3_AVAILABLE,
-        "available_browsers": available_browsers,
+        "available_browsers": detect_available_browsers(),
         "ytdlp_native_browsers": _YTDLP_BROWSER_PRIORITY,
     })
 
@@ -780,22 +766,16 @@ def auto_cookies():
     wanted    = body.get("browsers")
     if wanted:
         original_loaders = _BROWSER_LOADERS[:]
-        filtered = [
+        _BROWSER_LOADERS[:] = [
             (dn, fn) for dn, fn in _BROWSER_LOADERS
             if fn.lower() in [b.lower() for b in wanted]
         ]
-        _BROWSER_LOADERS[:] = filtered
         ok, msg = auto_extract_cookies(save_path)
         _BROWSER_LOADERS[:] = original_loaders
     else:
         ok, msg = auto_extract_cookies(save_path)
-
-    status_code = 200 if ok else 422
-    return jsonify({
-        "ok":      ok,
-        "message": msg,
-        "cookies_file": str(COOKIES_FILE) if ok else None,
-    }), status_code
+    return jsonify({"ok": ok, "message": msg,
+                    "cookies_file": str(COOKIES_FILE) if ok else None}), 200 if ok else 422
 
 
 @app.route("/api/auth/google/start")
@@ -845,8 +825,6 @@ def google_disconnect():
     return jsonify({"ok": True})
 
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-
 @app.route("/api/cleanup", methods=["POST"])
 def cleanup():
     n = 0
@@ -862,14 +840,11 @@ if __name__ == "__main__":
     print("  ║    YTDLPro v2 — YouTube Downloader        ║")
     print("  ║    → http://localhost:5001                 ║")
     print("  ╚═══════════════════════════════════════════╝\n")
-
     if not COOKIES_FILE.exists():
         if BC3_AVAILABLE:
             print("  [cookies] Probing browsers for YouTube cookies…")
             ok, msg = auto_extract_cookies()
             print(f"  [cookies] {'✓' if ok else '✗'} {msg}")
         else:
-            print("  [cookies] browser_cookie3 not installed — skipping auto-detect.")
-            print("  [cookies] Install with:  pip install browser-cookie3")
-
+            print("  [cookies] browser_cookie3 not installed — skipping.")
     app.run(host="0.0.0.0", port=5001, debug=True, threaded=True)
