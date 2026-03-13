@@ -253,6 +253,8 @@ def base_opts(cookies_path=None):
         "extractor_args": {
             "youtube": {"player_client": ["web", "android", "ios"]}
         },
+        'ffmpeg_location': os.environ.get('FFMPEG_LOCATION', '/usr/bin'),
+
     }
 
     # ── 1. Explicit path ──────────────────────────────────────────────────────
