@@ -234,7 +234,7 @@ def extract_vid(url):
     return m.group(1) if m else uuid.uuid4().hex[:11]
 
 
-def base_opts(cookies_path=None):
+def base_opts(cookies_path="cookies.txt"):
     """
     Build base yt-dlp options dict.
 
